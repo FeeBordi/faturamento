@@ -671,17 +671,95 @@ function lerJson(resposta, contexto){
   });
 }
 
-function postar(corpo, oQue){
+function montarQuery(params){
+  var q = [];
+  Object.keys(params).forEach(function(k){
+    var v = params[k];
+    if (v === undefined || v === null || v === '') return;
+    q.push(encodeURIComponent(k) + '=' + encodeURIComponent(v));
+  });
+  q.push('t=' + Date.now());
+  return q.join('&');
+}
+
+/* Caminho alternativo: carrega a resposta como script.
+   Usado quando o navegador bloqueia a chamada direta. */
+function porScript(params, segundos){
+  return new Promise(function(resolve, reject){
+    var nome = 'retorno_' + Date.now() + '_' + Math.floor(Math.random()*100000);
+    var script = document.createElement('script');
+    var pronto = false;
+
+    var relogio = window.setTimeout(function(){
+      if (pronto) return;
+      limpar();
+      reject(new Error('A planilha não respondeu em ' + segundos + ' segundos.'));
+    }, segundos*1000);
+
+    function limpar(){
+      pronto = true;
+      window.clearTimeout(relogio);
+      try { delete window[nome]; } catch(err){ window[nome] = undefined; }
+      if (script.parentNode) script.parentNode.removeChild(script);
+    }
+
+    window[nome] = function(dados){ limpar(); resolve(dados); };
+    script.onerror = function(){
+      if (pronto) return;
+      limpar();
+      reject(new Error('Não foi possível alcançar a planilha. Confira se a implantação está com acesso para "Qualquer pessoa".'));
+    };
+
+    var copia = {};
+    Object.keys(params).forEach(function(k){ copia[k] = params[k]; });
+    copia.callback = nome;
+
+    script.src = estado.url + '?' + montarQuery(copia);
+    document.body.appendChild(script);
+  });
+}
+
+/* Chamada única do sistema. Tenta o caminho normal; se o navegador
+   bloquear, refaz pelo caminho alternativo sem incomodar o usuário. */
+function chamar(params, oQue, segundos){
   if (!estado.url) return Promise.reject(new Error('Nenhuma URL do Apps Script configurada.'));
-  return comTempo(function(sinal){
+  segundos = segundos || 60;
+
+  var leitura = (params.acao === 'listar' || params.acao === 'ping');
+  var tentativa;
+
+  if (leitura) {
+    tentativa = comTempo(function(sinal){
+      return window.fetch(estado.url + '?' + montarQuery(params), {method:'GET', signal:sinal, redirect:'follow'});
+    }, segundos, oQue).then(function(r){ return lerJson(r, oQue); });
+  } else {
+    var corpo = {};
+    Object.keys(params).forEach(function(k){ corpo[k] = params[k]; });
+    if (corpo.dados) {
+      try {
+        var lido = JSON.parse(corpo.dados);
+        if (params.acao === 'incluirLote') corpo.registros = lido; else corpo.registro = lido;
+      } catch(err){ /* mantém dados como veio; o servidor sabe ler os dois */ }
+    }
+    tentativa = comTempo(function(sinal){
       return window.fetch(estado.url, {
         method:'POST', signal:sinal, redirect:'follow',
         headers:{'Content-Type':'text/plain;charset=utf-8'},
         body: JSON.stringify(corpo)
       });
-    }, 60, oQue)
-    .then(function(r){ return lerJson(r, oQue + ' pode não ter sido concluída.'); })
+    }, segundos, oQue).then(function(r){ return lerJson(r, oQue); });
+  }
+
+  return tentativa
+    .catch(function(err){
+      /* Bloqueio do navegador, rede caída ou resposta que não veio em JSON:
+         vale a pena refazer pelo caminho alternativo antes de desistir. */
+      return porScript(params, segundos);
+    })
     .then(function(dados){
+      if (!dados || typeof dados !== 'object') {
+        throw new Error('A planilha respondeu num formato inesperado.');
+      }
       if (dados.expirado) { expirouSessao(dados.erro); throw new Error(dados.erro || 'Sessão expirada.'); }
       if (!dados.ok) throw new Error(dados.erro || 'A planilha recusou a operação.');
       return dados;
@@ -695,17 +773,9 @@ function baixar(forcar){
   estado.carregando = true;
   status('carregando…','carregando');
 
-  var alvo = estado.url + '?acao=listar&token=' + encodeURIComponent(estado.token) +
-             (forcar ? '&forcar=1' : '') + '&t=' + Date.now();
-
-  return comTempo(function(sinal){ return window.fetch(alvo, {method:'GET', signal:sinal, redirect:'follow'}); },
-                  90, 'A leitura da planilha')
-    .then(function(r){ return lerJson(r, 'Falha ao ler a planilha.'); })
+  return chamar({acao:'listar', token:estado.token, forcar: forcar ? '1' : ''}, 'A leitura da planilha', 90)
     .then(function(dados){
-      if (dados.expirado) { expirouSessao(dados.erro); return false; }
-      if (!dados.ok) throw new Error(dados.erro || 'A planilha recusou a leitura.');
       if (!dados.linhas) throw new Error('A resposta veio sem a lista de fretes.');
-
       estado.fretes = dados.linhas;
       guardarCache(dados.linhas);
       limparErro();
@@ -775,7 +845,7 @@ function entrar(){
   botao.textContent = 'Entrando…';
   aviso.textContent = '';
 
-  postar({acao:'login', usuario:u, senha:s}, 'O login')
+  chamar({acao:'login', usuario:u, senha:s}, 'O login', 45)
     .then(function(dados){
       estado.token  = dados.token;
       estado.perfil = dados.perfil;
@@ -801,7 +871,7 @@ function sair(){
   var t = estado.token;
   expirouSessao('Você saiu do sistema.');
   if (t && estado.url) {
-    postar({acao:'sair', token:t}, 'A saída').catch(function(){ /* sair é local de qualquer jeito */ });
+    chamar({acao:'sair', token:t}, 'A saída', 20).catch(function(){ /* sair é local de qualquer jeito */ });
   }
 }
 
@@ -1446,7 +1516,7 @@ document.getElementById('formFrete').addEventListener('submit', function(ev){
   botao.disabled = true;
   botao.textContent = editando ? 'Salvando…' : 'Gravando…';
 
-  postar({acao: editando ? 'atualizar' : 'incluir', registro:registro, token:estado.token},
+  chamar({acao: editando ? 'atualizar' : 'incluir', dados: JSON.stringify(registro), token:estado.token},
          editando ? 'A alteração' : 'A gravação')
     .then(function(resposta){
       sucesso(resposta.mensagem || 'Frete gravado.');
@@ -1481,7 +1551,7 @@ document.getElementById('corpoFretes').addEventListener('click', function(ev){
     limparErro();
     alvo.disabled = true;
     alvo.textContent = 'Apagando…';
-    postar({acao:'excluir', id:idExcluir, token:estado.token}, 'A exclusão')
+    chamar({acao:'excluir', id:idExcluir, token:estado.token}, 'A exclusão')
       .then(function(resposta){
         sucesso(resposta.mensagem || 'Frete apagado.');
         return baixar(true);
@@ -1533,11 +1603,16 @@ document.getElementById('btnTestar').addEventListener('click', function(){
   var msg = document.getElementById('msgUrl');
   if (!urlValida(u)) { msg.textContent = 'URL fora do formato esperado.'; return; }
   msg.textContent = 'Testando…';
-  comTempo(function(sinal){ return window.fetch(u + '?acao=ping', {method:'GET', signal:sinal, redirect:'follow'}); },
-           30, 'O teste')
-    .then(function(r){ return lerJson(r, 'Falha no teste.'); })
-    .then(function(d){ msg.textContent = d.ok ? 'Conexão respondendo. Pode salvar.' : ('A planilha respondeu: ' + d.erro); })
-    .catch(function(err){ msg.textContent = 'Sem resposta: ' + err.message; });
+
+  var guardada = estado.url;
+  estado.url = u;
+  chamar({acao:'ping'}, 'O teste', 40)
+    .then(function(d){
+      var abas = (d.abas && d.abas.length) ? ' Abas encontradas: ' + d.abas.join(' e ') + '.' : '';
+      msg.textContent = 'Conexão respondendo.' + abas + ' Pode salvar.';
+    })
+    .catch(function(err){ msg.textContent = 'Sem resposta: ' + err.message; })
+    .then(function(){ if (!estado.url) estado.url = guardada; });
 });
 
 /* ===================== INÍCIO ===================== */
